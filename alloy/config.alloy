@@ -1,0 +1,94 @@
+// === RECEIVERS ===
+
+// OTLP from any application → resourcedetection (enrichment) → batch → exporter
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    logs    = [otelcol.processor.resourcedetection.default.input]
+    metrics = [otelcol.processor.resourcedetection.default.input]
+    // Traces also go through resourcedetection (same as logs — so spans carry
+    // host.name etc.), then batch, then to Tempo.
+    traces  = [otelcol.processor.resourcedetection.default.input]
+  }
+}
+
+// Batch traces before shipping to Tempo.
+otelcol.processor.batch "traces" {
+  output {
+    traces = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+// OTLP gRPC → Tempo (inside the docker network). Tempo accepts OTLP natively,
+// trace_id/span_id propagate 1:1 from the application into Tempo's storage.
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+    tls {
+      insecure = true
+    }
+  }
+}
+
+// === PROCESSORS ===
+
+// Detect host attributes (system, env) and attach them as resource attributes —
+// shared by logs and traces so Tempo and Loki see the same labels
+// (service.name, host.name, deployment.environment).
+otelcol.processor.resourcedetection "default" {
+  detectors = ["env", "system"]
+
+  output {
+    logs    = [otelcol.processor.batch.default.input]
+    traces  = [otelcol.processor.batch.traces.input]
+    metrics = [otelcol.processor.batch.metrics.input]
+  }
+}
+
+// Batch before shipping (default batch is for logs).
+otelcol.processor.batch "default" {
+  output {
+    logs = [otelcol.exporter.otlphttp.loki.input]
+  }
+}
+
+// Batch metrics before shipping to Mimir. Dedicated batch (separate from logs)
+// because the export cadence is different — the SDK's PeriodicReader flushes
+// every 15s, while logs/spans stream more continuously.
+otelcol.processor.batch "metrics" {
+  output {
+    metrics = [otelcol.exporter.otlphttp.mimir.input]
+  }
+}
+
+// === EXPORTERS ===
+
+// OTLP HTTP → Loki's native OTLP endpoint (Loki 3.0+ accepts OTLP without
+// conversion). Native OTLP preserves all OTel semantic conventions in
+// structured metadata.
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = "http://loki:3100/otlp"
+    tls {
+      insecure = true
+    }
+  }
+}
+
+// OTLP HTTP → Mimir's native OTLP endpoint (Mimir 2.10+ accepts OTLP without
+// conversion). Resource attrs (service.name etc.) become Prometheus labels;
+// dots in metric names are converted to underscores.
+otelcol.exporter.otlphttp "mimir" {
+  client {
+    endpoint = "http://mimir:9009/otlp"
+    tls {
+      insecure = true
+    }
+  }
+}

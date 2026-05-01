@@ -1,0 +1,60 @@
+# Single-binary Tempo with a filesystem backend.
+# metrics_generator with the local-blocks processor is enabled — required by
+# the Grafana Traces Drilldown plugin (RED metrics derived from traces).
+# Local-only, no remote_write.
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# metrics_generator component — aggregates rate / errors / duration from
+# incoming traces into block storage (locally, no Prometheus required).
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+  storage:
+    path: /var/tempo/generator/wal
+  # The local-blocks processor needs a SEPARATE WAL for the traces buffer
+  # (in addition to storage.path which is for the registry agent). Without
+  # this: "local blocks processor requires traces wal" + spans aren't aggregated.
+  traces_storage:
+    path: /var/tempo/generator/traces
+  processor:
+    # local-blocks writes aggregates as on-disk blocks — Traces Drilldown
+    # queries them via the TraceQL Metrics API (`{} | rate()`,
+    # `quantile_over_time()`) and gets results without needing Prometheus.
+    local_blocks:
+      # flush_to_storage: true allows querying historical data (after the
+      # local-blocks WAL has been flushed to block storage).
+      flush_to_storage: true
+
+# Activate the local-blocks processor for every tenant (default tenant is
+# "single-tenant" here). Without this, metrics_generator builds but the
+# processor is inactive.
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [local-blocks]
+
+usage_report:
+  reporting_enabled: false

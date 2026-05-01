@@ -1,0 +1,124 @@
+name: lgtmp
+
+# Grafana LGTMP observability stack:
+#   L oki       — logs
+#   G rafana    — UI
+#   T empo      — traces
+#   M imir      — metrics
+#   + Pyroscope — profiles
+#   + Alloy     — OTLP collector that fans signals out to the right backend
+#
+# Point your OTel-instrumented application at:
+#   - alloy        OTLP gRPC :4317  / OTLP HTTP :4318  (logs/traces/metrics)
+#   - pyroscope    HTTP push :4040                       (CPU profiles)
+# and open Grafana on http://localhost:3001 (anonymous Admin in dev — see README).
+
+services:
+  loki:
+    image: grafana/loki:latest
+    container_name: lgtmp-loki
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+
+  tempo:
+    # 2.9.2 (stable release from 2026-03-27) instead of :latest, because :latest
+    # pulls bleeding-edge mainline where the local_blocks processor was removed
+    # (PR #6555, March 2026). Drilldown Traces requires local_blocks for TraceQL
+    # Metrics, so we pin to the last stable release that still has it.
+    image: grafana/tempo:2.9.2
+    container_name: lgtmp-tempo
+    command: -config.file=/etc/tempo/tempo-config.yml
+    ports:
+      - "3200:3200"  # query API; OTLP (4317/4318) only inside the network
+    volumes:
+      - ./tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
+      - tempo-data:/var/tempo
+
+  mimir:
+    image: grafana/mimir:2.13.0
+    container_name: lgtmp-mimir
+    command: -config.file=/etc/mimir/mimir-config.yml
+    ports:
+      - "9009:9009"
+    volumes:
+      - ./mimir/mimir-config.yml:/etc/mimir/mimir-config.yml:ro
+      - mimir-data:/var/mimir
+
+  pyroscope:
+    image: grafana/pyroscope:latest
+    container_name: lgtmp-pyroscope
+    # Retention is set via CLI flag rather than the YAML config — Pyroscope
+    # :latest doesn't accept retention under `pyroscopedb`.
+    command: -config.file=/etc/pyroscope/pyroscope-config.yml -compactor.blocks-retention-period=168h
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./pyroscope/pyroscope-config.yml:/etc/pyroscope/pyroscope-config.yml:ro
+      # The Pyroscope image declares VOLUME /data in its Dockerfile — mount on
+      # /data, not on a custom path, otherwise the non-root pyroscope user
+      # can't write into a root-owned mount and ingest fails with HTTP 422.
+      - pyroscope-data:/data
+
+  alloy:
+    image: grafana/alloy:v1.5.0
+    container_name: lgtmp-alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - --stability.level=experimental
+      - /etc/alloy/config.alloy
+    ports:
+      - "12345:12345"  # Alloy UI
+      - "4317:4317"    # OTLP gRPC receiver
+      - "4318:4318"    # OTLP HTTP receiver
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+      mimir:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lgtmp-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      # DEV ONLY — anonymous Admin so you don't need to log in. For any
+      # exposed deployment (LAN/internet), remove these and configure proper
+      # auth (basic/OAuth/LDAP). See README "Production hardening".
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=logsExploreTableVisualisation,logsInfiniteScrolling,lokiLogsDataplane
+      - GF_INSTALL_PLUGINS=grafana-lokiexplore-app,grafana-exploretraces-app
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+      mimir:
+        condition: service_started
+      pyroscope:
+        condition: service_started
+
+volumes:
+  loki-data:
+  tempo-data:
+  alloy-data:
+  grafana-data:
+  mimir-data:
+  pyroscope-data:

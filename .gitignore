@@ -1,0 +1,10 @@
+# Editor / IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Local overrides
+docker-compose.override.yml
+.env
+.env.local

@@ -1,0 +1,18 @@
+apiVersion: 1
+
+datasources:
+  - name: Mimir
+    type: prometheus
+    uid: mimir
+    access: proxy
+    url: http://mimir:9009/prometheus
+    isDefault: false
+    jsonData:
+      timeInterval: 15s
+      # exemplarTraceIdDestinations is intentionally omitted — Rust OTel SDK
+      # 0.31 does not implement an exemplar reservoir (every aggregation point
+      # emits exemplars: vec![] hardcoded). Once upstream lands exemplar
+      # support, replace this comment with:
+      #   exemplarTraceIdDestinations:
+      #     - name: trace_id
+      #       datasourceUid: tempo

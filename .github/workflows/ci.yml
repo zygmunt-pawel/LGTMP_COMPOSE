@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: docker compose config (lint)
+        run: docker compose config --quiet
+
+  validate-yaml:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate every YAML file parses
+        run: |
+          python3 - <<'EOF'
+          import sys, pathlib, yaml
+          errors = []
+          for p in pathlib.Path('.').rglob('*.yml'):
+              try:
+                  list(yaml.safe_load_all(p.read_text()))
+              except yaml.YAMLError as e:
+                  errors.append(f"{p}: {e}")
+          for p in pathlib.Path('.').rglob('*.yaml'):
+              try:
+                  list(yaml.safe_load_all(p.read_text()))
+              except yaml.YAMLError as e:
+                  errors.append(f"{p}: {e}")
+          if errors:
+              print("::error::Invalid YAML:")
+              for e in errors:
+                  print(f"  {e}")
+              sys.exit(1)
+          print("All YAML files parse OK.")
+          EOF
+
+  validate-dashboards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate dashboard JSON files
+        run: |
+          for f in grafana/dashboards/*.json; do
+            python3 -c "import json; json.load(open('$f'))" || exit 1
+          done
+          echo "All dashboard JSON files parse OK."
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: docker compose up -d
+        run: docker compose up -d
+
+      - name: Wait for services to become ready
+        run: |
+          # Each service has a different ready endpoint.
+          for i in {1..60}; do
+            curl -sf http://localhost:3100/ready >/dev/null && \
+            curl -sf http://localhost:3200/ready >/dev/null && \
+            curl -sf http://localhost:9009/ready >/dev/null && \
+            curl -sf http://localhost:4040/ready >/dev/null && \
+            curl -sf http://localhost:3001/api/health >/dev/null && \
+              exit 0
+            sleep 5
+          done
+          echo "::error::Services did not become ready in 5 minutes"
+          docker compose ps
+          docker compose logs --tail=50
+          exit 1
+
+      - name: Verify Grafana datasources are provisioned
+        run: |
+          curl -s http://localhost:3001/api/datasources \
+            | python3 -c "
+          import sys, json
+          ds = json.load(sys.stdin)
+          want = {'Loki', 'Tempo', 'Mimir', 'Pyroscope'}
+          got = {d['name'] for d in ds}
+          missing = want - got
+          if missing:
+              print(f'::error::Missing datasources: {missing}')
+              sys.exit(1)
+          print(f'All 4 datasources provisioned: {sorted(got)}')
+          "
+
+      - name: docker compose down
+        if: always()
+        run: docker compose down -v

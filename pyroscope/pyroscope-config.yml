@@ -1,0 +1,26 @@
+# Pyroscope single-binary — every role in one process.
+# In production: switch to microservices mode + S3 storage.
+
+# Disable analytics reporting to Grafana Inc.
+analytics:
+  reporting_enabled: false
+
+server:
+  http_listen_port: 4040
+  http_listen_address: 0.0.0.0
+  log_level: warn
+
+# Filesystem storage for profile blocks (dev only).
+# NOTE: must be /data — the Pyroscope :latest image declares VOLUME /data
+# in its Dockerfile. Mounting on a custom path would create a root-owned
+# directory the non-root pyroscope user can't write to → ingest fails 422.
+storage:
+  backend: filesystem
+  filesystem:
+    dir: /data
+
+# Block size cap. Retention is set via the CLI flag
+# `-compactor.blocks-retention-period=168h` (7 days) in docker-compose.yml,
+# because Pyroscope :latest doesn't accept retention under `pyroscopedb`.
+pyroscopedb:
+  max_block_duration: 15m

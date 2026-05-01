@@ -1,0 +1,55 @@
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false
+    editable: false
+    jsonData:
+      # Click a span in Tempo → "View logs" jumps to Loki, pre-filtered by
+      # trace_id, in a time window around that span.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: '-1m'
+        spanEndTimeShift: '1m'
+        filterByTraceID: true
+        tags:
+          - key: service.name
+            value: service_name
+      # Click a span in Tempo → "Request rate for span route" jumps to Mimir,
+      # pre-filtered by the span's http.route. This is the trace→metric
+      # direction; metric→trace via exemplars is currently blocked upstream
+      # in Rust OTel SDK 0.31 (no exemplar reservoir implemented).
+      tracesToMetrics:
+        datasourceUid: mimir
+        tags:
+          - key: service.name
+            value: service_name
+          - key: http.route
+            value: http_route
+        queries:
+          - name: 'Request rate for span route'
+            query: 'sum(rate(http_server_request_duration_count{http_route="$${__tags.http_route}"}[1m]))'
+          - name: 'p99 latency for span route'
+            query: 'histogram_quantile(0.99, sum by (le) (rate(http_server_request_duration_bucket{http_route="$${__tags.http_route}"}[5m])))'
+      # Click a span in Tempo → "Profiles for this span" jumps to Pyroscope,
+      # pre-filtered by time window (start_time/end_time of the span).
+      # Time-based correlation, not tag-based — works perfectly for low-traffic
+      # apps; in high-traffic the window aggregates multiple concurrent requests.
+      tracesToProfiles:
+        datasourceUid: pyroscope
+        tags:
+          - { key: service.name, value: service_name }
+        profileTypeId: 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
+        customQuery: false
+      # Tempo Search.
+      search:
+        hide: false
+      # Service map showing span relations (root → child).
+      serviceMap:
+        datasourceUid: tempo
+      nodeGraph:
+        enabled: true

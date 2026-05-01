@@ -1,0 +1,23 @@
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: true
+    jsonData:
+      timeout: 60
+      maxLines: 1000
+      # derivedFields picks up trace_id from log events (as a structured-metadata
+      # field) and renders it as a clickable link that opens Tempo with that
+      # trace_id. This closes the log↔trace loop: clicking on a handler log
+      # → root http_request span with client_ip / route / user_agent attrs.
+      derivedFields:
+        - name: trace_id
+          datasourceUid: tempo
+          matcherType: label
+          matcherRegex: trace_id
+          url: '$${__value.raw}'
+          urlDisplayLabel: 'View Trace'

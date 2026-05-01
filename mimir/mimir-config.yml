@@ -1,0 +1,77 @@
+# Mimir 2.13 single-binary — every role in one process. Do not use in
+# production without switching to microservices mode + S3 storage.
+target: all
+
+# No X-Scope-OrgID — Grafana datasource queries without the header. Everything
+# lands on the default "anonymous" tenant.
+multitenancy_enabled: false
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+  log_level: warn
+
+# Shared storage for every module that needs an object store —
+# saves repeating paths per module.
+common:
+  storage:
+    backend: filesystem
+    filesystem:
+      dir: /var/mimir/data
+
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: /var/mimir/blocks
+  bucket_store:
+    sync_dir: /var/mimir/sync
+  tsdb:
+    dir: /var/mimir/tsdb
+
+# Single-instance ring — instance_addr 127.0.0.1, in-memory kvstore,
+# avoids needing memberlist/consul.
+ingester:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+    replication_factor: 1
+
+# Compactor and store-gateway also single-instance.
+compactor:
+  data_dir: /var/mimir/compactor
+  sharding_ring:
+    kvstore:
+      store: inmemory
+
+store_gateway:
+  sharding_ring:
+    kvstore:
+      store: inmemory
+    replication_factor: 1
+
+ruler:
+  # rule_path is the scratch dir for rule evaluation — MUST differ from
+  # ruler_storage.filesystem.dir, otherwise Mimir 2.13 fails at startup
+  # with "ruler data directory cannot overlap with storage filesystem".
+  rule_path: /var/mimir/ruler-scratch
+ruler_storage:
+  backend: filesystem
+  filesystem:
+    dir: /var/mimir/rules
+
+alertmanager:
+  data_dir: /var/mimir/alertmanager
+  sharding_ring:
+    replication_factor: 1
+alertmanager_storage:
+  backend: filesystem
+  filesystem:
+    dir: /var/mimir/alertmanager-store
+
+# Limits — exemplars enabled (without this all OTLP exemplars are dropped
+# at ingestion time). 100k is plenty for a demo / small workload.
+limits:
+  max_global_exemplars_per_user: 100000
+  ingestion_rate: 100000
+  ingestion_burst_size: 200000
