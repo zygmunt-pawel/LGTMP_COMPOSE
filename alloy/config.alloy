@@ -92,3 +92,38 @@ otelcol.exporter.otlphttp "mimir" {
     }
   }
 }
+
+// === HOST + CONTAINER METRICS (Prometheus scrape) ===
+// node-exporter exposes host-level metrics (CPU, RAM, disk, network) on :9100.
+// cAdvisor exposes per-container metrics (CPU, RAM, network, disk I/O,
+// container_spec_* limit-aware metrics) on :8080. Both are Prometheus pull
+// model; alloy scrapes them every 15s and forwards into Mimir via
+// prometheus.remote_write (Mimir's native Prometheus push API).
+
+prometheus.scrape "node_exporter" {
+  targets = [
+    {
+      "__address__" = "node-exporter:9100",
+      "job"         = "node-exporter",
+    },
+  ]
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+}
+
+prometheus.scrape "cadvisor" {
+  targets = [
+    {
+      "__address__" = "cadvisor:8080",
+      "job"         = "cadvisor",
+    },
+  ]
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+}
+
+prometheus.remote_write "mimir" {
+  endpoint {
+    url = "http://mimir:9009/api/v1/push"
+  }
+}

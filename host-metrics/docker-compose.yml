@@ -1,0 +1,54 @@
+name: host-metrics
+
+# Host + container metrics, scraped by alloy (in lgtmp_compose) over Prometheus
+# pull model. Works in two scenarios:
+#
+# 1. Single-machine — run this compose on the same host as lgtmp_compose.
+#    alloy reaches :9100 / :8080 via the host gateway (default config in
+#    lgtmp_compose maps node-exporter / cadvisor to host-gateway).
+#
+# 2. Multi-machine — run this compose on the app-box (where the application
+#    lives) while lgtmp_compose runs on obs-box. Override extra_hosts in
+#    obs-box's lgtmp_compose so alloy resolves node-exporter / cadvisor to
+#    app-box's IP/hostname.
+#
+# /proc, /sys, /var/run/docker.sock and / must be host-mounted because
+# node_exporter and cAdvisor read kernel/cgroups data — they MUST run on the
+# machine they're observing, you can't measure a host remotely.
+
+services:
+  node-exporter:
+    image: prom/node-exporter:v1.10.1
+    container_name: host-metrics-node-exporter
+    restart: unless-stopped
+    pid: host
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      # Skip pseudo-filesystems and container overlay mounts — they balloon
+      # series count without telling you anything useful.
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/.+)($$|/)
+      - --collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$$
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: host-metrics-cadvisor
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    devices:
+      - /dev/kmsg:/dev/kmsg

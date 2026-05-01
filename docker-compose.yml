@@ -79,6 +79,16 @@ services:
     volumes:
       - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
       - alloy-data:/var/lib/alloy/data
+    # Maps node-exporter and cadvisor to the host gateway. With this, alloy can
+    # scrape host-metrics (a separate compose project on the same machine) on
+    # ports :9100 and :8080 even though they live in a different docker network.
+    # For multi-host (obs-box ≠ app-box) override these in compose.override.yml:
+    #   extra_hosts:
+    #     - "node-exporter:192.168.1.50"   # app-box IP/hostname
+    #     - "cadvisor:192.168.1.50"
+    extra_hosts:
+      - "node-exporter:host-gateway"
+      - "cadvisor:host-gateway"
     depends_on:
       loki:
         condition: service_started

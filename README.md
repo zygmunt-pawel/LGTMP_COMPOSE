@@ -206,6 +206,156 @@ hosts and set up auth headers via `auth = otelcol.auth.basic...` blocks.
   processor we rely on for TraceQL Metrics. Stay on 2.9.x until that's
   resolved upstream.
 
+## Host + container metrics
+
+LGTMP gives you metrics that **the application itself** emits via OTel
+(`http.server.request.duration`, custom counters, etc.). It does not give
+you metrics about **the host the app runs on** (CPU, RAM, disk free) or
+**the container** (per-container CPU/RAM/network, throttling, OOM proximity)
+— those need separate exporters.
+
+Two extra services in [`host-metrics/docker-compose.yml`](host-metrics/docker-compose.yml)
+cover this:
+
+| Exporter | Port | What it measures |
+|---|---|---|
+| **node-exporter** | `:9100` | Whole-host CPU, RAM, disk, network, load avg, swap (reads `/proc`, `/sys`) |
+| **cAdvisor** | `:8080` | Per-container CPU, RAM, network, disk I/O, plus **limits** like `container_spec_cpu_quota` and `container_spec_memory_limit_bytes` (talks to docker daemon + cgroups) |
+
+### Pull model — alloy is required
+
+node-exporter and cAdvisor are **pull-only**. They expose `/metrics` on HTTP
+and wait for someone to scrape them. They do **not** push to Grafana Cloud
+or Mimir directly — that's not in their design.
+
+Alloy bridges this:
+
+```text
+                 ┌──────────────────┐
+                 │  alloy           │
+  /metrics ←─────┤  prometheus.     │  remote_write
+                 │   scrape ──────────────→  Mimir / Grafana Cloud
+  /metrics ←─────┤                  │
+                 └──────────────────┘
+```
+
+`prometheus.scrape "node_exporter"` and `prometheus.scrape "cadvisor"` blocks
+in `alloy/config.alloy` pull every 15s. `prometheus.remote_write "mimir"`
+pushes the result to Mimir's native push API.
+
+### Why pull, why alloy
+
+- Pull discipline (regular sample times, easy "target down" detection via `up == 0`)
+- node-exporter / cAdvisor would need HTTPS + auth on every host to push
+  directly — pull lets the scraper hold credentials in one place
+- Alloy is the standard way to do this in the Grafana stack; alternatives
+  (Prometheus standalone, OpenTelemetry Collector, Vector) work the same way
+
+You **cannot** make node-exporter or cAdvisor push directly to Grafana Cloud.
+You always need a scraper-pusher in the loop.
+
+### Locality requirement
+
+`/proc`, `/sys`, `/var/run/docker.sock` are **local filesystem things**.
+node-exporter and cAdvisor must run **on the same host** as the resources
+they observe. You can't scrape a remote host's `/proc`. Alloy can be
+anywhere (it just needs network reach to the exporters' HTTP endpoints).
+
+### Three deployment scenarios
+
+#### 1. Single host (default) — easiest
+
+Both compose projects on the same machine. Alloy reaches node-exporter and
+cAdvisor via the **host gateway** — Docker maps the hostname `node-exporter`
+(set by `extra_hosts: ["node-exporter:host-gateway"]` on alloy) to the
+host's IP, which is where `host-metrics` exposed ports `:9100` and `:8080`.
+
+Run it:
+```bash
+docker compose up -d                              # in lgtmp_compose/
+cd host-metrics && docker compose up -d           # in host-metrics/
+```
+
+Open Grafana on `http://localhost:3001` — `Explore → Mimir` and try
+`up{job="node-exporter"}` (should be 1) or
+`container_memory_usage_bytes{name="lgtmp-grafana"}` (live RAM use of the
+Grafana container itself).
+
+For dashboards, import these from grafana.com:
+- [1860 — Node Exporter Full](https://grafana.com/grafana/dashboards/1860)
+- [14282 — cAdvisor Compute Resources](https://grafana.com/grafana/dashboards/14282)
+
+#### 2. Multi-host, alloy on obs-box only — simpler but exposes ports
+
+`obs-box` runs `lgtmp_compose`. `app-box` runs your app + `host-metrics`.
+Alloy on obs-box scrapes node-exporter / cAdvisor over the network on
+app-box.
+
+On `app-box`:
+```bash
+cd host-metrics && docker compose up -d
+# Ports :9100 (node-exporter) and :8080 (cAdvisor) are now reachable
+# from anywhere that can talk to app-box on the network.
+```
+
+On `obs-box`, override the host mapping in a
+`docker-compose.override.yml` next to `lgtmp_compose/docker-compose.yml`:
+```yaml
+services:
+  alloy:
+    extra_hosts:
+      - "node-exporter:192.168.1.50"   # app-box's IP or hostname
+      - "cadvisor:192.168.1.50"
+```
+
+Then `docker compose up -d`. Alloy will resolve `node-exporter:9100` to
+`192.168.1.50:9100` and scrape it across the network.
+
+**Caveats:**
+- Ports `:9100` and `:8080` on app-box are exposed to whatever can reach it
+  (your LAN, possibly internet). Firewall them or use a private network.
+- node-exporter has no built-in auth — assume that anyone who can reach
+  the port can read your host metrics.
+- Network jitter / outages between obs-box and app-box show up as gaps
+  in metrics. Alloy's prometheus.scrape doesn't buffer (Prometheus pull
+  protocol assumes regular reachability).
+
+#### 3. Multi-host, alloy sidecar on every host — the standard production pattern
+
+Each host runs its own alloy alongside the things it monitors. The local
+alloy scrapes its host's node-exporter / cAdvisor and the local app's OTLP
+export, and `prometheus.remote_write`s upstream — to a central alloy on
+obs-box, or directly to Grafana Cloud.
+
+**Why this is preferred:**
+- Alloy local buffers to disk on network glitches (no metric loss for short
+  outages)
+- App pushes OTLP to `localhost:4317` — never knows any cloud secrets
+- node-exporter / cAdvisor stay on a private docker network, no exposed
+  ports on the host
+- Adding a second app-box is just deploying the same sidecar bundle
+
+**Layout (sketch — not in this repo):**
+```
+app-box/docker-compose.yml:
+  - alloy_app   (scrapes localhost:9100, :8080, receives :4317 from app)
+  - node-exporter
+  - cadvisor
+  - <your app>
+
+obs-box/docker-compose.yml = lgtmp_compose:
+  - alloy_obs   (receives push from alloy_app via remote_write)
+  - loki, tempo, mimir, pyroscope, grafana
+```
+
+Or `alloy_app` writes directly to Grafana Cloud Mimir (with auth headers)
+and you skip running a central alloy entirely.
+
+This pattern isn't shipped as a third compose project here — when you need
+it, copy `host-metrics/docker-compose.yml` and the relevant
+`prometheus.scrape` / `prometheus.remote_write` blocks from `alloy/config.alloy`
+into a new `app-box-sidecar/` compose alongside your app.
+
 ## See also
 
 - [`rust_telemetry`](https://github.com/zygmunt-pawel/rust_telemetry) —
