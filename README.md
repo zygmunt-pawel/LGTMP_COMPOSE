@@ -1,29 +1,34 @@
 # lgtmp_compose
 
-A standalone, batteries-included **Grafana LGTMP observability stack** in
-docker compose. One command, six containers, four pillars of observability,
-all wired together with bidirectional cross-signal navigation in Grafana.
+Self-contained **Grafana LGTMP storage stack** in docker compose. One command,
+five containers, four pillars of observability storage, all queryable through
+a pre-provisioned Grafana with cross-signal navigation already wired.
+
+This stack is intentionally **just the storage/query layer** — it has no
+collector. Apps don't push directly here. The recommended setup is:
 
 ```text
-   L oki      ←─ logs                              ┌─────────────┐
-   G rafana    ─ UI                                │   YOUR APP  │
-   T empo     ←─ traces                            │  (any OTel- │
-   M imir     ←─ metrics                           │ instrumented│
-   + Pyroscope (CPU profiles)                      │  service)   │
-   + Alloy    (OTLP collector that fans out to the └──────┬──────┘
-              right backend)                              │
-                                                          │ OTLP gRPC :4317
-                                                          │ OTLP HTTP :4318
-                                                          │ Pyroscope :4040
-                                                          ▼
-                                            ┌──────────────────────┐
-                                            │  alloy → loki/tempo/ │
-                                            │           mimir      │
-                                            │  pyroscope (direct)  │
-                                            │                      │
-                                            │  grafana :3001 (UI)  │
-                                            └──────────────────────┘
+   ┌─────────────── app-box ──────────────────┐    ┌────────── obs-box ──────────┐
+   │                                          │    │                             │
+   │  ┌──────────┐                            │    │  loki      :3100            │
+   │  │ your app │ ──OTLP localhost:4317──┐   │    │  tempo     :4317 (gRPC)     │
+   │  └──────────┘                        │   │    │            :3200 (queries)  │
+   │                                      ▼   │    │  mimir     :9009            │
+   │  ┌────────────────────────────────────┐  │    │  pyroscope :4040            │
+   │  │ alloy_host_agent (systemd, native) │──┼────┼─►grafana   :3001 (UI)       │
+   │  │ - host metrics (node_exporter)     │  │    │                             │
+   │  │ - container metrics (cAdvisor)     │  │    └─────────────────────────────┘
+   │  │ - OTLP forwarder (from your app)   │  │
+   │  └────────────────────────────────────┘  │
+   └──────────────────────────────────────────┘
 ```
+
+The agent on app-box ([`alloy_host_agent`](https://github.com/zygmunt-pawel/alloy_host_agent))
+collects host + container metrics, accepts OTLP from local apps on
+`localhost:4317`, and forwards everything over the network to the backends
+in this stack. For single-machine dev, install both on the same machine —
+the agent talks to `localhost:4317` (Tempo) etc. For multi-host LAN /
+production, install the agent on every app-box and point it at obs-box.
 
 ## Quick start
 
@@ -35,28 +40,32 @@ docker compose up -d
 
 Open Grafana at <http://localhost:3001> — anonymous Admin (dev defaults).
 
-Point your application's OTLP exporter at:
+Then install [`alloy_host_agent`](https://github.com/zygmunt-pawel/alloy_host_agent)
+on the machine where your application runs, and point it at the endpoints
+this stack exposes:
 
-| Signal | Endpoint | Protocol |
-|---|---|---|
-| Logs / Traces / Metrics | `localhost:4317` | OTLP gRPC |
-| Logs / Traces / Metrics | `localhost:4318` | OTLP HTTP |
-| Profiles | `localhost:4040` | Pyroscope native HTTP |
+```bash
+# in /etc/default/alloy (single-machine — same host):
+REMOTE_PROMETHEUS_URL=http://localhost:9009/api/v1/push
+REMOTE_OTLP_ENDPOINT=localhost:4317
 
-If you're using the [`rust_telemetry`](https://github.com/zygmunt-pawel/rust_telemetry)
-crate, this is one `Builder::new() ... .init()` away. Other languages have
-their own SDKs; any OpenTelemetry-compliant exporter works.
+# in /etc/default/alloy (multi-machine — obs-box on a sibling host):
+REMOTE_PROMETHEUS_URL=http://obs-box.lan:9009/api/v1/push
+REMOTE_OTLP_ENDPOINT=obs-box.lan:4317
+```
+
+Your application then pushes OTLP to its own `localhost:4317` (the agent),
+and the agent forwards everything here.
 
 ## What's inside
 
-| Service | Port (host) | What it does |
-|---|---|---|
-| **alloy** | `4317`, `4318`, `12345` | OTLP collector. Receives logs/traces/metrics from your app; fans them out to loki/tempo/mimir; UI on `:12345`. |
-| **loki** | `3100` | Log database. Stores OTLP logs from alloy with structured metadata. |
-| **tempo** | `3200` | Trace database. OTLP gRPC ingest internal; query API on `:3200`. metrics_generator + local-blocks for TraceQL Metrics. |
-| **mimir** | `9009` | Metric database. PromQL-compatible (Prometheus protocol) on `:9009/prometheus`. Exemplars enabled. |
-| **pyroscope** | `4040` | Continuous profiling backend. Receives push from your app's pyroscope agent. |
-| **grafana** | `3001` | UI. All four datasources auto-provisioned; example RED dashboard included. |
+| Service | Port (host) | What it does | Used by alloy_host_agent for |
+|---|---|---|---|
+| **loki** | `:3100` | Log database with structured-metadata support and pattern_ingester (Drilldown Patterns). | `OTLP HTTP /otlp/v1/logs` |
+| **tempo** | `:3200` (queries), `:4317` (OTLP gRPC), `:4318` (OTLP HTTP) | Trace database. metrics_generator + local-blocks for TraceQL Metrics. | `OTLP gRPC :4317` |
+| **mimir** | `:9009` | Prometheus-compatible metric database. PromQL on `:9009/prometheus`, push API on `:9009/api/v1/push`, also OTLP HTTP on `:9009/otlp`. Exemplars enabled. | `Prometheus push /api/v1/push` |
+| **pyroscope** | `:4040` | Continuous profiling backend (CPU profiles). Native HTTP push protocol. | `Pyroscope native push :4040` |
+| **grafana** | `:3001` | UI. All four datasources auto-provisioned with cross-signal links. Example RED dashboard included. | (used by humans, not the agent) |
 
 7-day retention for profiles, 30-day retention for logs (configurable in the
 respective config files).
@@ -93,8 +102,12 @@ which Mimir's OTLP receiver maps to `http_server_request_duration` (no
 
 If your app emits OTel HTTP server metrics with the standard label names
 (`http_route`, `http_response_status_code`), the dashboard populates with
-zero changes. Otherwise, edit the queries in the JSON to match your label
-schema.
+zero changes.
+
+For node + container dashboards (the data alloy_host_agent collects), import
+from grafana.com:
+- [1860 — Node Exporter Full](https://grafana.com/grafana/dashboards/1860)
+- [14282 — cAdvisor Compute Resources](https://grafana.com/grafana/dashboards/14282)
 
 To add your own dashboards, drop them in `grafana/dashboards/` — they're
 auto-loaded.
@@ -109,7 +122,7 @@ docker compose up -d
 docker compose logs -f
 
 # Restart a single service after config change
-docker compose restart alloy
+docker compose restart loki
 
 # Wipe all data (volumes) and start fresh
 docker compose down -v && docker compose up -d
@@ -176,15 +189,17 @@ grafana:
 Or wire OAuth/LDAP/SAML following the
 [Grafana docs](https://grafana.com/docs/grafana/latest/setup-grafana/configure-security/configure-authentication/).
 
-### Putting alloy on a separate machine
+### Auth between alloy_host_agent and the backends
 
-If the observability backends run on a dedicated "ops" host while the app
-runs elsewhere, the recommended pattern is **alloy as a sidecar with the
-app**, exporters pointing at the remote backends. The app pushes to its
-local `localhost:4317`; alloy forwards over the network with auth.
+The exposed ports (`:3100`, `:4317`, `:9009`, `:4040`) accept connections
+without authentication. Fine for `localhost` or a trusted LAN. For anything
+else:
 
-Adjust `alloy/config.alloy`'s `otelcol.exporter.*` clients to your remote
-hosts and set up auth headers via `auth = otelcol.auth.basic...` blocks.
+- Put a reverse proxy (Caddy, nginx, traefik) in front of the stack with
+  Basic auth; alloy_host_agent's env vars include `REMOTE_PROMETHEUS_AUTH`
+  and `REMOTE_OTLP_AUTH` for that.
+- Or use mTLS — both Loki/Tempo/Mimir and alloy support it but it's not
+  shipped here.
 
 ## Caveats
 
@@ -206,161 +221,20 @@ hosts and set up auth headers via `auth = otelcol.auth.basic...` blocks.
   processor we rely on for TraceQL Metrics. Stay on 2.9.x until that's
   resolved upstream.
 
-## Host + container metrics
-
-LGTMP gives you metrics that **the application itself** emits via OTel
-(`http.server.request.duration`, custom counters, etc.). It does not give
-you metrics about **the host the app runs on** (CPU, RAM, disk free) or
-**the container** (per-container CPU/RAM/network, throttling, OOM proximity)
-— those need separate exporters.
-
-Two extra services in [`host-metrics/docker-compose.yml`](host-metrics/docker-compose.yml)
-cover this:
-
-| Exporter | Port | What it measures |
-|---|---|---|
-| **node-exporter** | `:9100` | Whole-host CPU, RAM, disk, network, load avg, swap (reads `/proc`, `/sys`) |
-| **cAdvisor** | `:8080` | Per-container CPU, RAM, network, disk I/O, plus **limits** like `container_spec_cpu_quota` and `container_spec_memory_limit_bytes` (talks to docker daemon + cgroups) |
-
-### Pull model — alloy is required
-
-node-exporter and cAdvisor are **pull-only**. They expose `/metrics` on HTTP
-and wait for someone to scrape them. They do **not** push to Grafana Cloud
-or Mimir directly — that's not in their design.
-
-Alloy bridges this:
-
-```text
-                 ┌──────────────────┐
-                 │  alloy           │
-  /metrics ←─────┤  prometheus.     │  remote_write
-                 │   scrape ──────────────→  Mimir / Grafana Cloud
-  /metrics ←─────┤                  │
-                 └──────────────────┘
-```
-
-`prometheus.scrape "node_exporter"` and `prometheus.scrape "cadvisor"` blocks
-in `alloy/config.alloy` pull every 15s. `prometheus.remote_write "mimir"`
-pushes the result to Mimir's native push API.
-
-### Why pull, why alloy
-
-- Pull discipline (regular sample times, easy "target down" detection via `up == 0`)
-- node-exporter / cAdvisor would need HTTPS + auth on every host to push
-  directly — pull lets the scraper hold credentials in one place
-- Alloy is the standard way to do this in the Grafana stack; alternatives
-  (Prometheus standalone, OpenTelemetry Collector, Vector) work the same way
-
-You **cannot** make node-exporter or cAdvisor push directly to Grafana Cloud.
-You always need a scraper-pusher in the loop.
-
-### Locality requirement
-
-`/proc`, `/sys`, `/var/run/docker.sock` are **local filesystem things**.
-node-exporter and cAdvisor must run **on the same host** as the resources
-they observe. You can't scrape a remote host's `/proc`. Alloy can be
-anywhere (it just needs network reach to the exporters' HTTP endpoints).
-
-### Three deployment scenarios
-
-#### 1. Single host (default) — easiest
-
-Both compose projects on the same machine. Alloy reaches node-exporter and
-cAdvisor via the **host gateway** — Docker maps the hostname `node-exporter`
-(set by `extra_hosts: ["node-exporter:host-gateway"]` on alloy) to the
-host's IP, which is where `host-metrics` exposed ports `:9100` and `:8080`.
-
-Run it:
-```bash
-docker compose up -d                              # in lgtmp_compose/
-cd host-metrics && docker compose up -d           # in host-metrics/
-```
-
-Open Grafana on `http://localhost:3001` — `Explore → Mimir` and try
-`up{job="node-exporter"}` (should be 1) or
-`container_memory_usage_bytes{name="lgtmp-grafana"}` (live RAM use of the
-Grafana container itself).
-
-For dashboards, import these from grafana.com:
-- [1860 — Node Exporter Full](https://grafana.com/grafana/dashboards/1860)
-- [14282 — cAdvisor Compute Resources](https://grafana.com/grafana/dashboards/14282)
-
-#### 2. Multi-host, alloy on obs-box only — simpler but exposes ports
-
-`obs-box` runs `lgtmp_compose`. `app-box` runs your app + `host-metrics`.
-Alloy on obs-box scrapes node-exporter / cAdvisor over the network on
-app-box.
-
-On `app-box`:
-```bash
-cd host-metrics && docker compose up -d
-# Ports :9100 (node-exporter) and :8080 (cAdvisor) are now reachable
-# from anywhere that can talk to app-box on the network.
-```
-
-On `obs-box`, override the host mapping in a
-`docker-compose.override.yml` next to `lgtmp_compose/docker-compose.yml`:
-```yaml
-services:
-  alloy:
-    extra_hosts:
-      - "node-exporter:192.168.1.50"   # app-box's IP or hostname
-      - "cadvisor:192.168.1.50"
-```
-
-Then `docker compose up -d`. Alloy will resolve `node-exporter:9100` to
-`192.168.1.50:9100` and scrape it across the network.
-
-**Caveats:**
-- Ports `:9100` and `:8080` on app-box are exposed to whatever can reach it
-  (your LAN, possibly internet). Firewall them or use a private network.
-- node-exporter has no built-in auth — assume that anyone who can reach
-  the port can read your host metrics.
-- Network jitter / outages between obs-box and app-box show up as gaps
-  in metrics. Alloy's prometheus.scrape doesn't buffer (Prometheus pull
-  protocol assumes regular reachability).
-
-#### 3. Multi-host, alloy sidecar on every host — the standard production pattern
-
-Each host runs its own alloy alongside the things it monitors. The local
-alloy scrapes its host's node-exporter / cAdvisor and the local app's OTLP
-export, and `prometheus.remote_write`s upstream — to a central alloy on
-obs-box, or directly to Grafana Cloud.
-
-**Why this is preferred:**
-- Alloy local buffers to disk on network glitches (no metric loss for short
-  outages)
-- App pushes OTLP to `localhost:4317` — never knows any cloud secrets
-- node-exporter / cAdvisor stay on a private docker network, no exposed
-  ports on the host
-- Adding a second app-box is just deploying the same sidecar bundle
-
-**Layout (sketch — not in this repo):**
-```
-app-box/docker-compose.yml:
-  - alloy_app   (scrapes localhost:9100, :8080, receives :4317 from app)
-  - node-exporter
-  - cadvisor
-  - <your app>
-
-obs-box/docker-compose.yml = lgtmp_compose:
-  - alloy_obs   (receives push from alloy_app via remote_write)
-  - loki, tempo, mimir, pyroscope, grafana
-```
-
-Or `alloy_app` writes directly to Grafana Cloud Mimir (with auth headers)
-and you skip running a central alloy entirely.
-
-This pattern isn't shipped as a third compose project here — when you need
-it, copy `host-metrics/docker-compose.yml` and the relevant
-`prometheus.scrape` / `prometheus.remote_write` blocks from `alloy/config.alloy`
-into a new `app-box-sidecar/` compose alongside your app.
+- **No collector here.** Alloy / OpenTelemetry Collector / Vector — none
+  of these are part of this stack. They belong on the application's host,
+  not on the storage box. See [`alloy_host_agent`](https://github.com/zygmunt-pawel/alloy_host_agent).
 
 ## See also
 
+- [`alloy_host_agent`](https://github.com/zygmunt-pawel/alloy_host_agent) —
+  the systemd-native alloy agent that runs on every machine where your app
+  lives. Collects host + container metrics, accepts OTLP from local apps,
+  forwards everything to this stack.
 - [`rust_telemetry`](https://github.com/zygmunt-pawel/rust_telemetry) —
-  drop-in OTel SDK + Pyroscope setup for Rust apps. One `Builder::new() ... .init()`
-  call wires up logs/traces/metrics/profiles to this stack.
+  drop-in OTel SDK + Pyroscope setup for Rust apps. Configure with
+  `endpoint: "http://localhost:4317"` and your app's logs/traces/metrics
+  flow through alloy_host_agent into this stack.
 
 ## License
 

@@ -1,17 +1,28 @@
 name: lgtmp
 
-# Grafana LGTMP observability stack:
+# Grafana LGTMP storage stack:
 #   L oki       — logs
 #   G rafana    — UI
 #   T empo      — traces
 #   M imir      — metrics
 #   + Pyroscope — profiles
-#   + Alloy     — OTLP collector that fans signals out to the right backend
 #
-# Point your OTel-instrumented application at:
-#   - alloy        OTLP gRPC :4317  / OTLP HTTP :4318  (logs/traces/metrics)
-#   - pyroscope    HTTP push :4040                       (CPU profiles)
-# and open Grafana on http://localhost:3001 (anonymous Admin in dev — see README).
+# This stack is purely the storage/query layer. There is **no alloy here** —
+# alloy belongs next to your application, see the alloy_host_agent repo:
+#   https://github.com/zygmunt-pawel/alloy_host_agent
+#
+# Each backend exposes the port your alloy_host_agent (or any OTel-compliant
+# pusher) needs to write into. Apps DO NOT push directly to these ports;
+# they push to a local alloy_host_agent which forwards here.
+#
+# Endpoints exposed on the host (point alloy_host_agent at these):
+#   - Loki      :3100 — OTLP HTTP at /otlp/v1/logs (also LogQL queries)
+#   - Tempo     :4317 — OTLP gRPC for span ingestion
+#               :3200 — TraceQL queries (used by Grafana datasource)
+#   - Mimir     :9009 — Prometheus push API at /api/v1/push
+#                       and OTLP HTTP at /otlp/v1/metrics
+#   - Pyroscope :4040 — native HTTP push for profiles
+#   - Grafana   :3001 — UI (anonymous Admin in dev — see README)
 
 services:
   loki:
@@ -33,7 +44,9 @@ services:
     container_name: lgtmp-tempo
     command: -config.file=/etc/tempo/tempo-config.yml
     ports:
-      - "3200:3200"  # query API; OTLP (4317/4318) only inside the network
+      - "3200:3200"  # query API
+      - "4317:4317"  # OTLP gRPC ingestion (alloy_host_agent or any OTel pusher)
+      - "4318:4318"  # OTLP HTTP ingestion (HTTP-only OTel clients)
     volumes:
       - ./tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
       - tempo-data:/var/tempo
@@ -62,40 +75,6 @@ services:
       # /data, not on a custom path, otherwise the non-root pyroscope user
       # can't write into a root-owned mount and ingest fails with HTTP 422.
       - pyroscope-data:/data
-
-  alloy:
-    image: grafana/alloy:v1.5.0
-    container_name: lgtmp-alloy
-    command:
-      - run
-      - --server.http.listen-addr=0.0.0.0:12345
-      - --storage.path=/var/lib/alloy/data
-      - --stability.level=experimental
-      - /etc/alloy/config.alloy
-    ports:
-      - "12345:12345"  # Alloy UI
-      - "4317:4317"    # OTLP gRPC receiver
-      - "4318:4318"    # OTLP HTTP receiver
-    volumes:
-      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
-      - alloy-data:/var/lib/alloy/data
-    # Maps node-exporter and cadvisor to the host gateway. With this, alloy can
-    # scrape host-metrics (a separate compose project on the same machine) on
-    # ports :9100 and :8080 even though they live in a different docker network.
-    # For multi-host (obs-box ≠ app-box) override these in compose.override.yml:
-    #   extra_hosts:
-    #     - "node-exporter:192.168.1.50"   # app-box IP/hostname
-    #     - "cadvisor:192.168.1.50"
-    extra_hosts:
-      - "node-exporter:host-gateway"
-      - "cadvisor:host-gateway"
-    depends_on:
-      loki:
-        condition: service_started
-      tempo:
-        condition: service_started
-      mimir:
-        condition: service_started
 
   grafana:
     image: grafana/grafana:latest
@@ -128,7 +107,6 @@ services:
 volumes:
   loki-data:
   tempo-data:
-  alloy-data:
   grafana-data:
   mimir-data:
   pyroscope-data:
